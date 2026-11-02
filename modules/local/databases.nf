@@ -217,7 +217,7 @@ workflow prepare_databases {
         }
         // MINIMAP
         // Reference for minimap2: it can be a FASTA file or MMI index
-        if (params.classifier == "minimap2") {
+        if (params.classifier == "minimap2" || params.classifier == "bonefish") {
             database_dir = null  // not needed
             bracken_length = null // not needed
             if (params.reference) {
@@ -249,8 +249,8 @@ workflow prepare_databases {
                 if (!reference_url) {
                     throw new Exception(
                         "Error: Source $database_set does not include a reference for "
-                        + "use with minimap2, please choose another source, "
-                        + "provide a custom reference or disable minimap2.")
+                        + "use with ${params.classifier}, please choose another source, "
+                        + "provide a custom reference or disable the alignment classifier.")
                 }
                 reference = download_reference_ref2taxid(params.database_set, reference_url, ref2taxid_url, file(reference_url).simpleName)
                 reference_file = reference.reference_file

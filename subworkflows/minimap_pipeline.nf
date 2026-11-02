@@ -31,6 +31,7 @@ process minimap {
         path reference
         path ref2taxid
         val common_minimap2_opts
+        val aligner
     output:
         tuple val(meta),
             path("${meta.alias}.reference.bam"),
@@ -48,7 +49,7 @@ process minimap {
     // min_percent_identity and min_ref_coverage can be used within format_minimap2 or after the BAM is generated to not modify the raw BAM from the alignment.
     // Filter from ${meta.alias}.minimap2.assignments.tsv
     """
-    minimap2 -t $task.cpus ${common_minimap2_opts} $reference $concat_seqs \
+    ${aligner} -t $task.cpus ${common_minimap2_opts} $reference $concat_seqs \
     | samtools view -h -F 2304 - \
     | workflow-glue format_minimap2 - -o "${meta.alias}.minimap2.assignments.tsv" -r "$ref2taxid" \
     | samtools sort -@ ${task.cpus - 1} --write-index -o "${meta.alias}.reference.bam##idx##${meta.alias}.reference.bam.bai" -
@@ -234,14 +235,16 @@ workflow minimap_pipeline {
         taxonomic_rank
         common_minimap2_opts
         output_igv
+        aligner
     main:
 
-        // Run Minimap2
+        // Run the alignment classifier (minimap2 or bonefish)
         mm2 = minimap(
                 samples,
                 reference,
                 ref2taxid,
-                common_minimap2_opts
+                common_minimap2_opts,
+                aligner
         )
         // Add taxonomy
         mm2_taxonomy = minimapTaxonomy(mm2.assignments, taxonomy, taxonomic_rank)

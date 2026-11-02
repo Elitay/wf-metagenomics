@@ -28,6 +28,7 @@ process getVersions {
     taxonkit version | sed 's/ /,/' >> versions.txt
     csvtk version | sed 's/ /,/' >> versions.txt
     minimap2 --version | sed 's/^/minimap2,/' >> versions.txt
+    bonefish --version | head -n 1 | awk '{print "bonefish," \$NF}' >> versions.txt
     samtools --version | head -n 1 | sed 's/ /,/' >> versions.txt
     kraken2 --version | head -n 1 | sed 's/ version /,/' >> versions.txt
     bracken -v | sed 's/ /,/' >> versions.txt
