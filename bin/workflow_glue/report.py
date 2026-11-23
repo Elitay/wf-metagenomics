@@ -2,6 +2,10 @@
 """Create workflow report."""
 
 import json
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context
 
 from bokeh.models import HoverTool
 from dominate import tags as html_tags
@@ -22,6 +26,11 @@ from .util import get_named_logger, wf_parser  # noqa: ABS101
 
 # Setup simple globals
 THEME = 'epi2melabs'
+
+
+def _log_elapsed(logger, label, t0):
+    """Log wall time for a report section."""
+    logger.info(f"Section '{label}' took {time.perf_counter() - t0:.2f}s")
 
 
 def amr_section(amr_data, html_id):
@@ -93,6 +102,7 @@ def amr_section(amr_data, html_id):
 def main(args):
     """Run the entry point."""
     logger = get_named_logger("Report")
+    report_t0 = time.perf_counter()
     report = LabsReport(
         f"{args.workflow_name} Sequencing Report", args.workflow_name,
         args.params, args.versions, args.workflow_version)
@@ -107,11 +117,13 @@ def main(args):
     ranks_no_sk_k = SELECTED_RANKS[2:]
     abundance_threshold = args.abundance_threshold
     n_taxa_barplot = args.n_taxa_barplot
+    threads = max(1, int(getattr(args, "threads", 1) or 1))
 
     #
     # 1. READ SUMMARY
     #
     # Samples
+    t0 = time.perf_counter()
     with open(args.metadata) as metadata:
         sample_details = [{
             'sample': d['alias'],
@@ -140,25 +152,29 @@ def main(args):
             unmapped reads before both filters are applied.
             """)
         DataTable.from_pandas(report_utils.n_reads_pass(args.metadata))
+    _log_elapsed(logger, "read summary", t0)
 
     #
     # 2. TAXONOMY RESULTS
     #
 
     # Join taxonomy data
+    t0 = time.perf_counter()
     all_json = report_utils.parse_lineages(args.lineages[0])
     abundance_table = pd.read_csv(args.abundance_table, sep='\t')
     # need to read samples from the table, as it is in a different process
     # is not updated the same time that lineages: lineages can include 2 samples and
     # at the same moment abundance table just contains 1 of them.
     samples = [i for i in abundance_table.columns if i not in ['tax', 'total']]
-    # 2.1. SANKEY
+    _log_elapsed(logger, "lineage/abundance load", t0)
+
+    # 2.1. SANKEY + 2.2. SUNBURST
+    t0 = time.perf_counter()
     with report.add_section('Lineages', 'Lineages'):
         if all_json:
             ezc.metagenomics_sankey(all_json)
         else:
             em("""There are no taxa to display.""")
-    # 2.2. SUNBURST
     with report.add_section('Sunburst', 'Sunburst'):
         if all_json:
             tabs = Tabs()
@@ -183,8 +199,13 @@ def main(args):
                         lineages.clear()
         else:
             em("""There are no taxa to display.""")
+    _log_elapsed(logger, "sankey/sunburst", t0)
+
     # Save all ranks info
+    t0 = time.perf_counter()
     ranks_counts_filtered = []
+    ranks_counts = pd.DataFrame()
+    counts_per_taxa_df_filtered = pd.DataFrame()
     for rank in ranks_no_sk_k:  # avoid superkingdom (SK), kingdom(K)
         abundance_table_rank = abundance_table.copy()
         # update full taxonomy string to an string which finishes at the rank asked.
@@ -201,7 +222,9 @@ def main(args):
             ranks_counts = counts_per_taxa_df  # save last table
         else:
             ranks_counts = pd.DataFrame()
+    _log_elapsed(logger, "rank aggregation", t0)
     # Write report
+    t0 = time.perf_counter()
     with report.add_section('Taxonomy', 'Taxonomy'):
         if ranks_counts_filtered:
             tabs = Tabs()
@@ -253,7 +276,9 @@ def main(args):
                         EZChart(plt, THEME)
         else:
             em("""There are no taxa to display.""")
+    _log_elapsed(logger, "taxonomy barplots", t0)
     # 2.4. ABUNDANCE TABLE (top taxa only; full tables are published as TSV)
+    t0 = time.perf_counter()
     with report.add_section('Abundances', 'Abundances'):
         if ranks_counts_filtered:
             p(
@@ -350,11 +375,14 @@ def main(args):
                         )
         else:
             em("""There are no taxa to display.""")
+    _log_elapsed(logger, "abundance/rarefied tables", t0)
     #
     # 3. DIVERSITY
     #
 
     # Return counts for the last analyzed rank to calculate diversity
+    t0 = time.perf_counter()
+    richness_curve = {}
     if not ranks_counts.empty:
         last_analyzed_rank = ranks_counts[samples + ['total']]
         # Rarefy step by step
@@ -363,7 +391,9 @@ def main(args):
         richness_curve = {
             rarefied_counts.index[i]: rarefied_counts[i]
             for i in range(len(rarefied_counts.index))}
+    _log_elapsed(logger, "rarefaction curves", t0)
 
+    t0 = time.perf_counter()
     with report.add_section("Alpha Diversity", "Diversity"):
         if not ranks_counts.empty:
             tabs = Tabs()
@@ -459,10 +489,12 @@ def main(args):
             are excluded from the results. This may affect the diversity
             metrics and plots, such as the rarefaction curves.
         """)
+    _log_elapsed(logger, "diversity/SAD plots", t0)
     #
     # 4. AMR
     #
     if args.amr:
+        t0 = time.perf_counter()
         with report.add_section("Antimicrobial resistance", "AMR"):
             with open(args.params) as f:
                 params = json.load(f)
@@ -480,42 +512,83 @@ def main(args):
                             amr_section(data["results"], f"accordion_{sample_id}")
                         else:
                             p("No AMR genes detected in sample")
+        _log_elapsed(logger, "AMR", t0)
 
     #
     # 5. ALIGNMENT STATS
     #
     if args.align_stats:
-        samples_references = {}
-        for s in samples:
-            samples_references[s] = report_utils.load_alignment_data(
+        t0 = time.perf_counter()
+        # Abundance-filtered taxa at the last analyzed rank (leaf name).
+        allowed_taxa = None
+        if not counts_per_taxa_df_filtered.empty:
+            allowed_taxa = [
+                i.split(';')[-1] for i in counts_per_taxa_df_filtered['tax']
+            ]
+        jobs = [
+            (
                 args.align_stats,
-                s,
+                sample,
                 args.taxonomic_rank,
+                allowed_taxa,
+                report_utils.N_HEATMAP_REFS,
             )
-        # make sure that the samples really have data.
-        dataset_results = {k: v for k, v in samples_references.items() if v is not None}
+            for sample in samples
+        ]
+        prepared_by_sample = {}
+        workers = min(threads, max(1, len(jobs)))
+        if workers == 1:
+            for job in jobs:
+                sample, prepared = report_utils.prepare_alignment_job(job)
+                prepared_by_sample[sample] = prepared
+        else:
+            logger.info(
+                f"Preparing alignment stats for {len(jobs)} samples "
+                f"with {workers} workers."
+            )
+            with ProcessPoolExecutor(
+                max_workers=workers, mp_context=get_context("spawn")
+            ) as pool:
+                for sample, prepared in pool.map(
+                    report_utils.prepare_alignment_job, jobs
+                ):
+                    prepared_by_sample[sample] = prepared
+        _log_elapsed(logger, "alignment dataframe prep", t0)
+
+        t0 = time.perf_counter()
+        dataset_results = {}
+        for sample, prepared in prepared_by_sample.items():
+            if prepared is None:
+                continue
+            align_df, heatmap_matrix, rank_col = prepared
+            sample_t0 = time.perf_counter()
+            dataset_results[sample] = report_utils.build_alignment_plots(
+                sample, align_df, heatmap_matrix, rank_col
+            )
+            logger.info(
+                f"Alignment plots for {sample} took "
+                f"{time.perf_counter() - sample_t0:.2f}s"
+            )
         if len(dataset_results) >= 1:
             with report.add_section("Alignment Statistics", "References"):
                 tabs = Tabs()
                 # Show table with the detailed output.
                 with tabs.add_dropdown_menu("Dataset"):
-                    # It will apply on the last analyzed rank.
-                    taxa = [  # split the taxonomy string to the last value
-                        i.split(';')[-1] for i in counts_per_taxa_df_filtered['tax']]
                     for barcode, metrics in dataset_results.items():
-                        # Choose those species above the abundance threshold.
                         align_stats = metrics[0]
-                        align_stats_filtered = align_stats[align_stats[rank].isin(taxa)]
+                        table_rank = report_utils.resolve_alignment_rank(
+                            align_stats, args.taxonomic_rank
+                        )
                         with tabs.add_dropdown_tab(barcode):
                             p(
                                 "Only taxa present in the abundance table above the ",
                                 html_tags.code("abundance_threshold"),
-                                " parameter appear in the table."
+                                " parameter appear in the table. ",
+                                f"Heatmaps show up to {report_utils.N_HEATMAP_REFS} "
+                                "references with the highest mean depth."
                             )
                             DataTable.from_pandas(
-                                align_stats_filtered.set_index(
-                                    report_utils.RANKS_ABB[args.taxonomic_rank]
-                                ).round(2),
+                                align_stats.set_index(table_rank).round(2),
                                 export=True,
                                 file_name="wf-metagenomics-alignment",
                             )
@@ -544,17 +617,28 @@ def main(args):
                                     "divided into 100 evenly sized windows, and the ",
                                     "average depth across all positions in the window ",
                                     "is plotted in a cell in the heatmap. ",
-                                    "Only references with at least an average",
-                                    "sequencing depth > 1 across the entire ",
-                                    "reference sequence are included in the heatmap."
+                                    "Only abundance-filtered references are shown, ",
+                                    f"capped at the top {report_utils.N_HEATMAP_REFS} ",
+                                    "by mean sequencing depth."
                                 )
                                 EZChart(metrics[2], "epi2melabs")
                             else:
                                 p(
                                     "No taxa present with sufficient coverage for heatmap."  # noqa:E501
                                 )
+        _log_elapsed(logger, "alignment plots/embed", t0)
+
+    t0 = time.perf_counter()
     report.write(args.report)
-    logger.info(f"Report written to {args.report}.")
+    _log_elapsed(logger, "report.write", t0)
+    try:
+        report_bytes = os.path.getsize(args.report)
+    except OSError:
+        report_bytes = -1
+    logger.info(
+        f"Report written to {args.report} "
+        f"({report_bytes} bytes, total {time.perf_counter() - report_t0:.2f}s)."
+    )
 
 
 def argparser():
@@ -604,6 +688,9 @@ def argparser():
     parser.add_argument(
         "--n_taxa_barplot", default=9, type=int,
         help="Number of taxa to be displayed in the barplot.")
+    parser.add_argument(
+        "--threads", default=1, type=int,
+        help="Worker processes for alignment-stats dataframe prep.")
     parser.add_argument(
         "--workflow_version", default='unknown',
         help="version of the executed workflow")

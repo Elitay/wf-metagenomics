@@ -96,6 +96,8 @@ def split_taxonomy_string(counts_per_taxa_df, set_index=False):
 
 # Cap SAD barplots so Bokeh does not embed one category per taxon.
 N_TAXA_SAD = 200
+# Cap alignment heatmaps so ECharts JSON stays small in the HTML report.
+N_HEATMAP_REFS = 100
 
 
 def prepare_sad_counts(counts_df, sample, n_taxa=N_TAXA_SAD):
@@ -264,24 +266,69 @@ def parse_amr(amr_dir):
     return all_output
 
 
-def load_alignment_data(
-    align_stats,
-    sample,
-    rank='species',
+def resolve_alignment_rank(align_df, taxonomic_rank):
+    """Resolve the taxonomy column used for alignment plots and filters.
 
-):
-    """Load alignment data and return components for the report.
-
-    :param align_stats (string): Path to the files
-    :param sample (string): sample to be analyzed
-
-    :return [table, scatter, heatmap]
+    :param align_df (DataFrame): Alignment stats table.
+    :param taxonomic_rank (str): Rank abbreviation (e.g. ``S``) or full name.
+    :return (str): Column name present in ``align_df``.
     """
-    rank = RANKS_ABB[rank]
+    rank = RANKS_ABB.get(taxonomic_rank, taxonomic_rank)
+    if (rank == 'species') and (rank not in align_df.columns):
+        return 'genus'
+    return rank
+
+
+def filter_and_cap_alignment_frames(
+        align_df, heatmap_matrix, rank_col, allowed_taxa=None,
+        n_heatmap_refs=N_HEATMAP_REFS):
+    """Filter alignment frames by taxon and cap heatmap references.
+
+    :param align_df (DataFrame): Per-reference alignment stats.
+    :param heatmap_matrix (DataFrame): Windowed depth matrix (refs x windows).
+    :param rank_col (str): Taxonomy column used for filtering.
+    :param allowed_taxa (iterable|None): Taxon names to keep. None keeps all.
+    :param n_heatmap_refs (int): Maximum heatmap rows by mean depth.
+    :return (tuple): Filtered ``align_df`` and capped ``heatmap_matrix``.
+    """
+    filtered = align_df
+    if allowed_taxa is not None and rank_col in filtered.columns:
+        allowed = set(allowed_taxa)
+        filtered = filtered[filtered[rank_col].isin(allowed)]
+    if filtered.empty:
+        return filtered, heatmap_matrix.iloc[0:0].copy()
+
+    # Prefer refs that also appear in the heatmap; fall back to filtered table order.
+    heatmap_refs = [
+        ref for ref in filtered.sort_values(
+            by='mean depth', ascending=False)['reference']
+        if ref in heatmap_matrix.index
+    ]
+    top_refs = heatmap_refs[:n_heatmap_refs]
+    if not top_refs:
+        return filtered, heatmap_matrix.iloc[0:0].copy()
+    capped_heatmap = heatmap_matrix.loc[top_refs].copy()
+    return filtered, capped_heatmap
+
+
+def prepare_alignment_frames(
+        align_stats, sample, taxonomic_rank='S', allowed_taxa=None,
+        n_heatmap_refs=N_HEATMAP_REFS):
+    """Load and filter alignment TSVs without building plot objects.
+
+    Worker-safe: returns only pickleable DataFrames.
+
+    :param align_stats (str): Directory with alignment stats TSVs.
+    :param sample (str): Sample alias.
+    :param taxonomic_rank (str): Rank abbreviation from workflow params.
+    :param allowed_taxa (iterable|None): Abundance-filtered taxon names.
+    :param n_heatmap_refs (int): Max heatmap references.
+    :return (tuple|None): ``(align_df, heatmap_matrix, rank_col)`` or None.
+    """
     align_table = Path(f"{align_stats}/{sample}-alignment-stats.tsv")
     heatmap_table = Path(f"{align_stats}/{sample}-alignment-stats-heatmap.tsv")
     if not align_table.exists() or not heatmap_table.exists():
-        return
+        return None
     align_df = pd.read_csv(align_table, sep='\t')
     align_df.drop(['startpos'], axis=1, inplace=True)
     align_df.rename(
@@ -296,35 +343,41 @@ def load_alignment_data(
             'pcreads': '% reads'
             }, inplace=True)
     heatmap_matrix = pd.read_csv(heatmap_table, sep='\t', index_col=0)
-    # Second check to make sure the dataframe contains something
     if align_df.empty:
-        raise pd.errors.EmptyDataError(f"File is empty: {align_df}")
+        raise pd.errors.EmptyDataError(f"File is empty: {align_table}")
     if heatmap_matrix.empty:
-        raise pd.errors.EmptyDataError(f"File is empty: {heatmap_matrix}")
-    # create the scatter plot.
-    # x-axis is the number of reads, y-axis is the coverage.
-    # Depth: number of reads that map in X position
-    # Coverage: number of bases in the references that are covered by the reads.
-    # Color: the rank (eg. species) of each reference to identify different
-    # references of the same species. If species doesn't exist (e.g. silva db)
-    # use the previous rank.
-    if (rank == 'species') and (rank not in align_df.columns):
-        rank = 'genus'
+        raise pd.errors.EmptyDataError(f"File is empty: {heatmap_table}")
+
+    rank_col = resolve_alignment_rank(align_df, taxonomic_rank)
+    align_df, heatmap_matrix = filter_and_cap_alignment_frames(
+        align_df, heatmap_matrix, rank_col, allowed_taxa=allowed_taxa,
+        n_heatmap_refs=n_heatmap_refs)
+    if align_df.empty:
+        return None
+    return align_df, heatmap_matrix, rank_col
+
+
+def build_alignment_plots(sample, align_df, heatmap_matrix, rank_col):
+    """Build scatter and heatmap plots from prepared alignment frames.
+
+    Must run in the main process (Bokeh/ECharts objects are not process-safe).
+
+    :param sample (str): Sample alias for plot titles.
+    :param align_df (DataFrame): Filtered alignment stats.
+    :param heatmap_matrix (DataFrame): Capped heatmap matrix.
+    :param rank_col (str): Taxonomy column for scatter hue.
+    :return (list): ``[align_df, scatter_plot, heatmap_plot_or_None]``.
+    """
     plt_scatter = ezc.scatterplot(
         data=align_df,
-        x='number of reads', y='% coverage', hue=rank)
+        x='number of reads', y='% coverage', hue=rank_col)
     plt_scatter._fig.title.text = sample
     plt_scatter._fig.legend.visible = False
-    # Add ref to the plot to be able to access later in hover
-    # There is two glyd per species (rank), which is the hue
-    # eg. 10 different families -> 20 glyd
-    # Replace with the corresponding info based on the index value
     for gly in plt_scatter._fig.renderers:
-        # add more properties for hover later
         gly.data_source.data['reference'] = align_df.loc[
             list(gly.data_source.to_df().index)]['reference']
         gly.data_source.data['rank'] = align_df.loc[
-            list(gly.data_source.to_df().index)][rank]
+            list(gly.data_source.to_df().index)][rank_col]
     hover = plt_scatter._fig.select(dict(type=HoverTool))
     hover.tooltips = [
         ("number of reads", "@x"),
@@ -333,38 +386,76 @@ def load_alignment_data(
         ("taxa", "@rank")
     ]
 
-    # Add heatmap in blues to visualize the coverage of the reference and
-    # the sequencing depth by quartiles.
+    plt_heatmap = None
     if not heatmap_matrix.empty:
-        # Add rank names
-        refs_list = list(heatmap_matrix.index)
-        new_names = align_df.query("reference == @refs_list")['species']
+        labeled = heatmap_matrix.copy()
+        refs_list = list(labeled.index)
+        species_col = 'species' if 'species' in align_df.columns else rank_col
+        name_map = (
+            align_df.drop_duplicates('reference')
+            .set_index('reference')[species_col]
+            .to_dict()
+        )
         new_names_shorten = []
-        # Short names if they are too long
-        for ref, tx in zip(refs_list, new_names):
+        for ref in refs_list:
+            tx = str(name_map.get(ref, ''))
             if len(tx) < 15:
-                new_names_shorten.append(ref + "-" + tx)
+                new_names_shorten.append(f"{ref}-{tx}")
             else:
-                new_names_shorten.append(ref + "-" + tx[:15] + '...')
-        heatmap_matrix.index = new_names_shorten
+                new_names_shorten.append(f"{ref}-{tx[:15]}...")
+        labeled.index = new_names_shorten
 
         cmap = sns.color_palette(
-            "Blues",  n_colors=1000, as_cmap=False).as_hex()
-        plt_heatmap = ezc.heatmap(
-            heatmap_matrix,
-            annot=False, cmap=cmap)
+            "Blues", n_colors=1000, as_cmap=False).as_hex()
+        plt_heatmap = ezc.heatmap(labeled, annot=False, cmap=cmap)
         plt_heatmap.tooltip = dict(position='top', trigger='item')
-        # Hide axis names as is explained in the description
         plt_heatmap.xAxis.name = ""
         plt_heatmap.xAxis.axisLabel = dict(rotate=90, fontSize=10)
         plt_heatmap.yAxis.axisLabel = dict(fontSize=10)
         plt_heatmap.title = dict(text=sample)
-        # This is to show the whole ref name
         plt_heatmap.grid = dict(left=10, containLabel=True)
-    else:
-        plt_heatmap = None
-    # return table, scatter, heatmap
+
     return [align_df, plt_scatter, plt_heatmap]
+
+
+def prepare_alignment_job(job):
+    """Process-pool entrypoint for one sample's alignment frame prep.
+
+    :param job (tuple): ``(align_stats, sample, taxonomic_rank, allowed_taxa,
+        n_heatmap_refs)``.
+    :return (tuple): ``(sample, prepared_or_None)``.
+    """
+    align_stats, sample, taxonomic_rank, allowed_taxa, n_heatmap_refs = job
+    prepared = prepare_alignment_frames(
+        align_stats, sample, taxonomic_rank=taxonomic_rank,
+        allowed_taxa=allowed_taxa, n_heatmap_refs=n_heatmap_refs)
+    return sample, prepared
+
+
+def load_alignment_data(
+    align_stats,
+    sample,
+    rank='S',
+    allowed_taxa=None,
+    n_heatmap_refs=N_HEATMAP_REFS,
+):
+    """Load alignment data and return components for the report.
+
+    :param align_stats (string): Path to the files
+    :param sample (string): sample to be analyzed
+    :param rank (string): Rank abbreviation (e.g. ``S``) or full name
+    :param allowed_taxa (iterable|None): Abundance-filtered taxon names
+    :param n_heatmap_refs (int): Max heatmap references
+
+    :return [table, scatter, heatmap]
+    """
+    prepared = prepare_alignment_frames(
+        align_stats, sample, taxonomic_rank=rank, allowed_taxa=allowed_taxa,
+        n_heatmap_refs=n_heatmap_refs)
+    if prepared is None:
+        return None
+    align_df, heatmap_matrix, rank_col = prepared
+    return build_alignment_plots(sample, align_df, heatmap_matrix, rank_col)
 
 
 def n_reads_pass(metadata):

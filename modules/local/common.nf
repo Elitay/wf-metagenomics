@@ -161,6 +161,7 @@ process makeReport {
         --taxonomic_rank "${taxonomic_rank}" \
         --abundance_threshold "${params.abundance_threshold}" \
         --n_taxa_barplot "${params.n_taxa_barplot}" \
+        --threads $task.cpus \
         ${align_stats} \
         ${amr}
     """
