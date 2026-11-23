@@ -94,6 +94,39 @@ def split_taxonomy_string(counts_per_taxa_df, set_index=False):
     return df_ranks
 
 
+# Cap SAD barplots so Bokeh does not embed one category per taxon.
+N_TAXA_SAD = 200
+
+
+def prepare_sad_counts(counts_df, sample, n_taxa=N_TAXA_SAD):
+    """Build a capped rank-abundance table for one sample.
+
+    Drops Unknown taxa, sorts by descending abundance, and keeps at most
+    ``n_taxa`` rows so SAD plots stay small in HTML reports.
+
+    :param counts_df (DataFrame): Abundance table with a ``tax`` column and
+        per-sample count columns.
+    :param sample (str): Sample column name.
+    :param n_taxa (int): Maximum number of taxa (bars) to return.
+    :return (DataFrame): Columns ``rank`` and ``freq``, or empty if no counts.
+    """
+    if counts_df is None or counts_df.empty or sample not in counts_df.columns:
+        return pd.DataFrame(columns=["rank", "freq"])
+    filtered = counts_df[~counts_df["tax"].astype(str).str.contains("Unknown")]
+    series = (
+        filtered[sample]
+        .sort_values(ascending=False)
+        .rename("freq")
+        .astype(int)
+    )
+    series = series[series > 0].head(n_taxa)
+    if series.empty or series.sum() == 0:
+        return pd.DataFrame(columns=["rank", "freq"])
+    out = series.to_frame()
+    out.index = list(range(1, out.shape[0] + 1))
+    return out.reset_index().rename(columns={"index": "rank"})
+
+
 def most_abundant_table(counts_per_taxa_df, n=10, percent=False):
     """Select most abundant taxa and group the rest into 'Other' taxa.
 

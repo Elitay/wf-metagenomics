@@ -11,7 +11,10 @@ import scipy as scp
 
 
 def random_choice(arr, sample_size, seed=4):
-    """Random sample n elements from the total of inviduals.
+    """Random sample n individuals without replacement from count abundances.
+
+    Uses multivariate hypergeometric sampling so memory stays O(n_taxa)
+    rather than O(total_reads).
 
     :param arr: vector with number of counts per taxa. Type: numpy array.
     :param sample_size: number of elements (n) to be randomly sampled. Type: int.
@@ -19,22 +22,17 @@ def random_choice(arr, sample_size, seed=4):
     :return: vector with rarefied counts.
     :rtype: numpy array.
     """
-    np.random.seed(seed)
-    arr = np.int64(arr)
-    # To avoid working with strings, index the positions
-    arr_idx = np.arange(len(arr))
-    # Extend numpy vector with their corresponding counts
-    long_arr = np.repeat(arr_idx, arr)
-    # Take sample_size elements and count frequencies
-    rarefied_vector = np.bincount(
-        np.random.choice(long_arr, sample_size, replace=False))
-    # If the last element of arr has not been subseted,
-    # the bin count has one element less length.
-    # Add a 0 counts for it
-    if len(arr) > len(rarefied_vector):
-        rarefied_vector = np.append(rarefied_vector, np.repeat(
-            0, len(arr)-len(rarefied_vector)))
-    return rarefied_vector
+    arr = np.asarray(arr, dtype=np.int64)
+    sample_size = int(sample_size)
+    if sample_size <= 0:
+        return np.zeros_like(arr)
+    total = int(arr.sum())
+    if total == 0:
+        return np.zeros_like(arr)
+    if sample_size >= total:
+        return arr.copy()
+    rng = np.random.default_rng(seed)
+    return rng.multivariate_hypergeometric(arr, sample_size)
 
 
 def global_rarefaction(df, min_counts=0.95, pc_reads=0.5, seed=4):
@@ -67,7 +65,7 @@ def global_rarefaction(df, min_counts=0.95, pc_reads=0.5, seed=4):
     return rarefied_df
 
 
-def rarefaction_curve(counts, n_repeats=10, n_points=15):
+def rarefaction_curve(counts, n_repeats=5, n_points=10):
     """Count richness (S) per set of subsample reads.
 
     :param counts: vector with number of counts per taxa. Type: pandas Series.
@@ -77,20 +75,19 @@ def rarefaction_curve(counts, n_repeats=10, n_points=15):
     :return: dictionary {number of sampled reads (str): richness (int)}.
     :rtype: dict.
     """
-    arr = np.array(counts)
-    total_counts = arr.sum()
+    arr = np.asarray(counts, dtype=np.int64)
+    total_counts = int(arr.sum())
     richness = {}
     # Take n counts from the total number of counts.
     # Do it in intervals saved in the lists steps.
-    # Divide each interval in 15 points.
-    # do not step more than available counts.
     steps = np.linspace(0, total_counts, num=n_points, dtype=int)
     for s in steps:  # iterate over number of counts to be sampled
         # Repeat n times and return mean S
         spc = np.zeros(n_repeats, dtype=int)
         for i in range(n_repeats):
+            # Vary seed per repeat for independent draws while staying deterministic
             spc[i] = round(observed_richness(
-                random_choice(np.array(counts), s)))
+                random_choice(arr, int(s), seed=4 + i)))
         richness[int(s)] = round(np.mean(spc))
     return richness
 

@@ -253,9 +253,17 @@ def main(args):
                         EZChart(plt, THEME)
         else:
             em("""There are no taxa to display.""")
-    # 2.4. ABUNDANCE TABLE
+    # 2.4. ABUNDANCE TABLE (top taxa only; full tables are published as TSV)
     with report.add_section('Abundances', 'Abundances'):
         if ranks_counts_filtered:
+            p(
+                "Showing the ",
+                html_tags.code("n_taxa_barplot"),
+                " most abundant taxa per rank. Full abundance tables are written "
+                "alongside this report as ",
+                html_tags.code("abundance_table_*.tsv"),
+                "."
+            )
             tabs = Tabs()
             with tabs.add_dropdown_menu('Abundance tables', change_header=False):
                 for i, counts_per_taxa_per_rank_df in enumerate(ranks_counts_filtered):
@@ -271,19 +279,26 @@ def main(args):
                         if counts_per_taxa_per_rank_df.empty:
                             em("""There are no taxa to display.""")
                             continue
-                        p(f"Abundance table for the {ranks_no_sk_k[i]} rank.")
+                        p(f"Top taxa at the {ranks_no_sk_k[i]} rank.")
                         p(
                             "Only taxa whose global abundance are above the ",
                             html_tags.code("abundance_threshold"),
-                            " parameter will appear in the table."
+                            " parameter are considered."
                         )
+                        summary = report_utils.most_abundant_table(
+                            counts_per_taxa_per_rank_df,
+                            n=n_taxa_barplot,
+                            percent=False,
+                        )
+                        # Drop the collapsed Other row from the summary table
+                        summary = summary[
+                            ~summary['tax'].astype(str).str.startswith('Other')
+                        ]
                         export_table = report_utils.split_taxonomy_string(
-                            counts_per_taxa_per_rank_df, set_index=True)
-                        # Move tax column to end to not spoil visualization
+                            summary, set_index=True)
                         temp_cols = export_table.columns.tolist()
                         new_cols = temp_cols[1:] + temp_cols[0:1]
                         export_table = export_table[new_cols]
-                        # Table to report with the export option
                         DataTable.from_pandas(
                             export_table,
                             export=True,
@@ -291,7 +306,7 @@ def main(args):
                                 f'{args.workflow_name}-counts-{ranks_no_sk_k[i]}'
                             )
                         )
-            # 2.5. RAREFIED ABUNDANCE TABLE
+            # 2.5. RAREFIED ABUNDANCE TABLE (top taxa only)
             with tabs.add_dropdown_menu(
                 "Rarefied Abundance tables", change_header=False
             ):
@@ -302,16 +317,27 @@ def main(args):
                         p(
                             """
                             All samples have been randomly subsetted to have the same
-                            number of reads.
+                            number of reads. Only the most abundant taxa are shown;
+                            use the published abundance TSVs for the full matrix.
                         """
                         )
-                        # Table to report with the export option
+                        sample_counts = counts_per_taxa_per_rank_df.set_index(
+                            'tax'
+                        ).drop(columns=['total'], errors='ignore')
                         rarefied_df = diversity.global_rarefaction(
-                            counts_per_taxa_per_rank_df.set_index('tax')).sort_index(
-                            axis=1).reset_index()
+                            sample_counts
+                        ).sort_index(axis=1)
+                        # Restore a total column for ranking, then truncate
+                        rarefied_df = rarefied_df.copy()
+                        rarefied_df['total'] = rarefied_df.sum(axis=1)
+                        rarefied_df = rarefied_df.reset_index()
+                        summary = report_utils.most_abundant_table(
+                            rarefied_df, n=n_taxa_barplot, percent=False)
+                        summary = summary[
+                            ~summary['tax'].astype(str).str.startswith('Other')
+                        ]
                         export_table = report_utils.split_taxonomy_string(
-                            rarefied_df, set_index=True)
-                        # Move tax column to end to not spoil visualization
+                            summary, set_index=True)
                         temp_cols = export_table.columns.tolist()
                         new_cols = temp_cols[1:] + temp_cols[0:1]
                         export_table = export_table[new_cols]
@@ -389,29 +415,23 @@ def main(args):
             #
             # 3.3. SPECIES ABUNDANCE DISTRIBUTION: SAD
             #
+            # Prefer abundance-filtered counts and cap bars to avoid huge Bokeh HTML.
+            sad_counts = (
+                ranks_counts_filtered[-1]
+                if ranks_counts_filtered
+                else ranks_counts
+            )
             with tabs.add_dropdown_menu(
                 "Taxa abundance distribution", change_header=False
             ):
                 for barcode in samples:
                     with tabs.add_dropdown_tab(barcode):
-                        # Remove Unknown
-                        ranks_counts = ranks_counts[
-                            ~(ranks_counts['tax'].str.contains('Unknown'))]
-                        df_sample_counts = (
-                            ranks_counts[barcode]
-                            .sort_values(ascending=False)
-                            .rename("freq")
-                            .to_frame()
+                        df_sample_counts = report_utils.prepare_sad_counts(
+                            sad_counts, barcode, n_taxa=report_utils.N_TAXA_SAD
                         )
-                        df_sample_counts.columns = ["freq"]
-                        if df_sample_counts["freq"].sum() > 0:
-                            df_sample_counts.index = list(
-                                range(1, df_sample_counts.shape[0] + 1)
-                            )
+                        if not df_sample_counts.empty:
                             plt = ezc.barplot(
-                                df_sample_counts.reset_index().rename(
-                                    columns={"index": "rank"}
-                                ),
+                                df_sample_counts,
                                 x="rank",
                                 y="freq",
                                 dodge=False,
@@ -423,8 +443,10 @@ def main(args):
                             plt._fig.xaxis.major_label_text_color = None
                             plt._fig.xaxis.major_tick_line_color = None
                             EZChart(plt, 'epi2melabs')
-                            em("""This plot includes all the counts (except Unknown),
-                            before applying any filter threshold based on abundances.
+                            em(f"""
+                            Rank-abundance plot of up to {report_utils.N_TAXA_SAD}
+                            most abundant taxa (Unknown excluded), after applying
+                            the abundance_threshold filter.
                             """)
                         # case of barcode03 with all unclassified.
                         else:

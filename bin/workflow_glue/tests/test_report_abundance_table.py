@@ -12,6 +12,7 @@ import pytest
 from workflow_glue.report_utils.report_utils import (
     filter_by_abundance,
     most_abundant_table,
+    prepare_sad_counts,
     RANK_ORDER,
     split_taxonomy_string
 )
@@ -206,3 +207,28 @@ def test_101_filter_by_abundance_file(
         expected_counts,
         actual
     )
+
+
+def test_201_prepare_sad_counts_caps_and_excludes_unknown():
+    """SAD helper caps taxa and drops Unknown rows."""
+    df = pd.DataFrame({
+        "tax": [f"rank;Sp{i}" for i in range(1, 12)] + ["rank;Unknown"],
+        "sample_a": list(range(11, 0, -1)) + [100],
+        "total": list(range(11, 0, -1)) + [100],
+    })
+    sad = prepare_sad_counts(df, "sample_a", n_taxa=5)
+    assert list(sad.columns) == ["rank", "freq"]
+    assert len(sad) == 5
+    assert list(sad["rank"]) == [1, 2, 3, 4, 5]
+    assert list(sad["freq"]) == [11, 10, 9, 8, 7]
+
+
+def test_202_prepare_sad_counts_empty_sample():
+    """SAD helper returns an empty frame when a sample has no counts."""
+    df = pd.DataFrame({
+        "tax": ["rank;Sp1", "rank;Unknown"],
+        "sample_a": [0, 5],
+        "total": [0, 5],
+    })
+    sad = prepare_sad_counts(df, "sample_a", n_taxa=200)
+    assert sad.empty
