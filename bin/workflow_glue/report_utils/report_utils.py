@@ -96,7 +96,6 @@ def split_taxonomy_string(counts_per_taxa_df, set_index=False):
 
 # Cap SAD barplots so Bokeh does not embed one category per taxon.
 N_TAXA_SAD = 200
-# Cap alignment heatmaps so ECharts JSON stays small in the HTML report.
 N_HEATMAP_REFS = 100
 
 

@@ -132,7 +132,6 @@ process makeReport {
         val metadata
         path(stats, stageAs:"stats/stats_*")
         path "abundance_table.tsv"
-        path "alignment_stats/*"
         path "lineages/*"
         path "versions/*"
         path "params.json"
@@ -144,7 +143,6 @@ process makeReport {
         String workflow_name = workflow.manifest.name.replace("epi2me-labs/","")
         String metadata = new JsonBuilder(metadata).toPrettyString()
         report_name = "${workflow_name}-report.html"
-        String align_stats = params.minimap2_by_reference ? "--align_stats alignment_stats" : ""
         String amr = params.amr as Boolean ? "--amr amr" : ""
     """
     echo '${metadata}' > metadata.json
@@ -162,7 +160,6 @@ process makeReport {
         --abundance_threshold "${params.abundance_threshold}" \
         --n_taxa_barplot "${params.n_taxa_barplot}" \
         --threads $task.cpus \
-        ${align_stats} \
         ${amr}
     """
 }

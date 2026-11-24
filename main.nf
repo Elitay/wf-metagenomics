@@ -233,13 +233,17 @@ workflow {
         for_report.meta.collect(),
         for_report.stats.collect(),
         results.abundance_table,
-        alignment_stats.ifEmpty(OPTIONAL_FILE),
         results.lineages,
         versions,
         parameters,
         databases.taxonomic_rank,
         amr_reports.ifEmpty(OPTIONAL_FILE)
     )
+    // Consume alignment-stats so getAlignmentStats still runs and publishes
+    // TSVs to alignment_tables/ when --minimap2_by_reference is set.
+    alignment_stats
+        .collect()
+        .view { "Alignment tables published under alignment_tables/." }
 }
 
 workflow.onComplete {

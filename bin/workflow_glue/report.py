@@ -4,8 +4,6 @@
 import json
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor
-from multiprocessing import get_context
 
 from bokeh.models import HoverTool
 from dominate import tags as html_tags
@@ -117,7 +115,6 @@ def main(args):
     ranks_no_sk_k = SELECTED_RANKS[2:]
     abundance_threshold = args.abundance_threshold
     n_taxa_barplot = args.n_taxa_barplot
-    threads = max(1, int(getattr(args, "threads", 1) or 1))
 
     #
     # 1. READ SUMMARY
@@ -517,116 +514,20 @@ def main(args):
     #
     # 5. ALIGNMENT STATS
     #
-    if args.align_stats:
-        t0 = time.perf_counter()
-        # Abundance-filtered taxa at the last analyzed rank (leaf name).
-        allowed_taxa = None
-        if not counts_per_taxa_df_filtered.empty:
-            allowed_taxa = [
-                i.split(';')[-1] for i in counts_per_taxa_df_filtered['tax']
-            ]
-        jobs = [
-            (
-                args.align_stats,
-                sample,
-                args.taxonomic_rank,
-                allowed_taxa,
-                report_utils.N_HEATMAP_REFS,
+    # When --minimap2_by_reference is set, per-sample alignment metrics are
+    # written as TSVs under alignment_tables/.
+    try:
+        with open(args.params) as fh:
+            report_params = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        report_params = {}
+    if report_params.get("minimap2_by_reference"):
+        with report.add_section("Alignment Statistics", "References"):
+            p(
+                "Per-reference alignment metrics are available as TSV files in ",
+                html_tags.code("alignment_tables/"),
+                "."
             )
-            for sample in samples
-        ]
-        prepared_by_sample = {}
-        workers = min(threads, max(1, len(jobs)))
-        if workers == 1:
-            for job in jobs:
-                sample, prepared = report_utils.prepare_alignment_job(job)
-                prepared_by_sample[sample] = prepared
-        else:
-            logger.info(
-                f"Preparing alignment stats for {len(jobs)} samples "
-                f"with {workers} workers."
-            )
-            with ProcessPoolExecutor(
-                max_workers=workers, mp_context=get_context("spawn")
-            ) as pool:
-                for sample, prepared in pool.map(
-                    report_utils.prepare_alignment_job, jobs
-                ):
-                    prepared_by_sample[sample] = prepared
-        _log_elapsed(logger, "alignment dataframe prep", t0)
-
-        t0 = time.perf_counter()
-        dataset_results = {}
-        for sample, prepared in prepared_by_sample.items():
-            if prepared is None:
-                continue
-            align_df, heatmap_matrix, rank_col = prepared
-            sample_t0 = time.perf_counter()
-            dataset_results[sample] = report_utils.build_alignment_plots(
-                sample, align_df, heatmap_matrix, rank_col
-            )
-            logger.info(
-                f"Alignment plots for {sample} took "
-                f"{time.perf_counter() - sample_t0:.2f}s"
-            )
-        if len(dataset_results) >= 1:
-            with report.add_section("Alignment Statistics", "References"):
-                tabs = Tabs()
-                # Show table with the detailed output.
-                with tabs.add_dropdown_menu("Dataset"):
-                    for barcode, metrics in dataset_results.items():
-                        align_stats = metrics[0]
-                        table_rank = report_utils.resolve_alignment_rank(
-                            align_stats, args.taxonomic_rank
-                        )
-                        with tabs.add_dropdown_tab(barcode):
-                            p(
-                                "Only taxa present in the abundance table above the ",
-                                html_tags.code("abundance_threshold"),
-                                " parameter appear in the table. ",
-                                f"Heatmaps show up to {report_utils.N_HEATMAP_REFS} "
-                                "references with the highest mean depth."
-                            )
-                            DataTable.from_pandas(
-                                align_stats.set_index(table_rank).round(2),
-                                export=True,
-                                file_name="wf-metagenomics-alignment",
-                            )
-                # Show reference scatterplot of number of reads by coverage.
-                with tabs.add_dropdown_menu("Scatter", change_header=False):
-                    for barcode, metrics in dataset_results.items():
-                        with tabs.add_dropdown_tab(barcode):
-                            p(
-                                "Scatter plot showing, for each reference, ",
-                                "the coverage (y-axis) and the number of mapped reads ",
-                                "(x-axis).\n",
-                                "Hover the cursor over the points to show ",
-                                "the reference name and species. ",
-                                "Zoom into a specific region to distinguish ",
-                                "between closest points."
-                            )
-                            EZChart(metrics[1], 'epi2melabs')
-                # Show heatmap of relative positional coverage.
-                with tabs.add_dropdown_menu("Heatmap", change_header=False):
-                    for barcode, metrics in dataset_results.items():
-                        with tabs.add_dropdown_tab(barcode):
-                            if metrics[2]:
-                                p(
-                                    "To illustrate consistency of coverage between ",
-                                    "the reference sequences, each reference is ",
-                                    "divided into 100 evenly sized windows, and the ",
-                                    "average depth across all positions in the window ",
-                                    "is plotted in a cell in the heatmap. ",
-                                    "Only abundance-filtered references are shown, ",
-                                    f"capped at the top {report_utils.N_HEATMAP_REFS} ",
-                                    "by mean sequencing depth."
-                                )
-                                EZChart(metrics[2], "epi2melabs")
-                            else:
-                                p(
-                                    "No taxa present with sufficient coverage for heatmap."  # noqa:E501
-                                )
-        _log_elapsed(logger, "alignment plots/embed", t0)
 
     t0 = time.perf_counter()
     report.write(args.report)
